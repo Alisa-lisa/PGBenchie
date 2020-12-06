@@ -1,28 +1,19 @@
 use anyhow::Result;
 use std::env;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::{Pool, postgres::PgPoolOptions, Postgres};
 use std::fs::read_to_string;
 use rand::seq::SliceRandom;
 use rand::{Rng, thread_rng};
 use rand::distributions::Alphanumeric;
+use futures::{stream::FuturesUnordered, future::{join_all, try_join_all}, StreamExt, TryStreamExt, TryFutureExt};
 
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    dotenv::dotenv().ok();
-
-    // Create a connection pool
-    let pool = PgPoolOptions::new()
-        .max_connections(100)
-        .connect(&env::var("DATABASE_URL")?).await?;
-    // dbg!(&pool);
-
+async fn setup_database(pool: &Pool<Postgres>) -> Result<()> {
     // According to postgres Docs: ROP DATABASE cannot be executed inside a transaction block.
     // This command cannot be executed while connected to the target database. 
     // Thus, it might be more convenient to use the program dropdb instead, which is a wrapper around this command.
     // existing db should be dropped and recreated manually as well as set in .env
     // 1. create tables (not optimized yet)
-    sqlx::query!("DROP TABLE IF EXISTS users CASCADE ").execute(&pool).await?;
+    sqlx::query!("DROP TABLE IF EXISTS users CASCADE ").execute(pool).await?;
     // let parent_table = read_to_string("queries/parent_table.sql");  // TODO: how to put this query into string literal????
     sqlx::query!("CREATE TABLE IF NOT EXISTS users (
             id integer PRIMARY KEY,
@@ -37,12 +28,12 @@ async fn main() -> Result<()> {
             tmp1 integer,
             tmp2 bool
             )")
-        .execute(&pool)
+        .execute(pool)
         .await?;    
     sqlx::query!("CREATE INDEX IF NOT EXISTS user_activity on users (registration, last_active) INCLUDE (tmp1)")
-        .execute(&pool)
+        .execute(pool)
         .await?;
-    sqlx::query!("DROP TABLE IF EXISTS attributes").execute(&pool).await?;
+    sqlx::query!("DROP TABLE IF EXISTS attributes").execute(pool).await?;
     sqlx::query!("CREATE TABLE IF NOT EXISTS attributes (
             usrid int,
             FOREIGN KEY(usrid) REFERENCES users(id) ON DELETE CASCADE ON UPDATE CASCADE,
@@ -51,43 +42,44 @@ async fn main() -> Result<()> {
             attribute_key varchar(60),
             attribute_value varchar(60)
             )")
-        .execute(&pool)
+        .execute(pool)
+        .await?;
+    sqlx::query!("CREATE INDEX IF NOT EXISTS usr on attributes (usrid)")
+        .execute(pool)
         .await?;
     // pool.close().await;  TODO: should i close connection here? i.e. restart?
+    Ok(())
+}
 
+static TOTAL_USERS: i32 = 2000000;
+static CHUNK_SIZE: usize = 1000;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    dotenv::dotenv().ok();
+
+    // Create a connection pool
+    let pool = PgPoolOptions::new()
+        .max_connections(1000)
+        .connect(&env::var("DATABASE_URL")?).await?;
+    // dbg!(&pool);
+
+    setup_database(&pool).await?;
     
-    // TODO: how to start jobs in parallel?
-    let mut populate_users = Vec::new();
-    let mut userids = Vec::new();
-    // make initial population as a sql batch opertion
-    for id in 1..101 {
-        userids.push(id);
-        populate_users
-            .push(sqlx::query!("INSERT INTO users VALUES ($1, 'some_name', 26, 'Other', 'NewCity', 'Some', 'Single', '2020-12-04', '2020-12-04', 230, true)", id));
-    }
-    for task in populate_users {
-        task.execute(&pool).await?;
-    }
-    let mut populate_attributes = Vec::new();
+    let mut user_insertions = vec![];
+    for id in 0..TOTAL_USERS {
+        user_insertions.push(sqlx::query!("INSERT INTO users VALUES ($1, 's', 26, 'o', 'NC', 'S', 'S', '2020-12-04', '2020-12-04', 230, true)", id).execute(&pool));
+    };
     
-    for _ in 1..1001 {
-        let mut rngesus = thread_rng();
-        let cat: String = std::iter::repeat(()).map(|()| rngesus.sample(Alphanumeric)).take(10).collect();
-        populate_attributes.push(sqlx::query!("INSERT INTO attributes VALUES ($1, '2020-12-04', $2, $3, $4)", 
-                                              userids.choose(&mut rngesus), 
-                                              &cat, 
-                                              &cat, 
-                                              &cat));
-    }
-    for task in populate_attributes {
-        task.execute(&pool).await?;
-    }
-   // on top fo populated  
+    let stream_of_futures = futures::stream::iter(user_insertions);
+    let buffered = stream_of_futures.buffer_unordered(CHUNK_SIZE as usize);
 
-    let record = sqlx::query!(r#"select 1 as "id""#)
-        .fetch_one(&pool).await?;
-
-    dbg!(record);
+    buffered.for_each(|b| async {
+        match b {
+            Ok(_b) => (),
+            Err(e) => eprintln!("nope: {}", e),
+        }
+    }).await;
 
     Ok(())
 }

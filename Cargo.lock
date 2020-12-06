@@ -688,6 +688,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dotenv",
+ "futures",
  "rand",
  "sqlx",
  "tokio",
